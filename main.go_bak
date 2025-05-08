@@ -1,0 +1,146 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	// since the types are ambiguous, we need to import the types package with a different name, all services have the same types package, so we need to alias it to avoid conflicts. Its like import types as ec2types in python.
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+)
+
+var instanceIDs = []string{
+	"i-01f2ea7b820b96c58",
+	"i-0e895bfc3270142d7",
+	"i-0eb21ace5c041a907",
+	"i-0cd358de55c5f2001",
+}
+
+const newInstanceType = "t3.medium"
+const originalType = "t2.micro"
+
+// Name:   aws.String("tag:instance_mode"), Values: []string{"other_instances"}, This tells AWS: Only give me instances that have a tag instance_mode=other_instances. This tags are created by the script itself at runtime and deleted when the instance is stopped and reverted to t2.micro.
+const tagKey = "instance_mode"
+const tagValue = "other_instances"
+
+func main() {
+
+	// Create a context for the AWS SDK operations, without a timeout or cancellation. The context is used to pass request-scoped values, cancellation signals, and deadlines across API boundaries. its does not have a timeout or cancellation signal.
+	ctx := context.Background()
+
+	// config.LoadDefaultConfig(ctx) function from the AWS SDK for Go v2 automatically looks for your AWS configuration and credentials in the default locations, such as environment variables, shared credentials file, and AWS config file. at ~/.aws/config and ~/.aws/credentials.
+	// It also allows you to specify a custom profile if needed.
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatal("🚫 Failed to load AWS config:", err)
+	}
+
+	// Create an EC2 client using the loaded configuration
+	// The EC2 client is used to interact with the EC2 service, such as describing instances, stopping instances, and modifying instance attributes.
+	ec2Client := ec2.NewFromConfig(cfg)
+
+	// Describe Instances
+	descOutput, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+		InstanceIds: instanceIDs,
+	})
+
+	// // Check for errors in the DescribeInstances call with tagKey and tagValue instead of instanceIDs
+	// descOutput, err := ec2Client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+	// 	Filters: []ec2types.Filter{
+	// 		{
+	// 			Name:   aws.String("tag:" + tagKey),
+	// 			Values: []string{tagValue},
+	// 		},
+	// 	},
+	// })
+
+	// If the instance is not found, the DescribeInstances call will return an error. This is expected if the instance has already been stopped or terminated.
+	if err != nil {
+		log.Fatalf("❌ Failed to describe instances: %v", err)
+	}
+
+	// A reservation is a collection of one or more EC2 instances and instance is an individual EC2 instance with its own properties like InstanceId, InstanceType, State, and Tags
+	for _, reservation := range descOutput.Reservations { // Loop through all reservations
+		for _, instance := range reservation.Instances { // Loop through all instances in the reservation
+			id := *instance.InstanceId                   // id will now contain the EC2 instance's unique ID (e.g., "i-0a123bc45d678efgh")
+			currentType := string(instance.InstanceType) // Get the current instance type as a string
+			state := string(instance.State.Name)         // Get the current state of the instance (e.g., "running", "stopped")
+
+			var modeTag string
+			for _, tag := range instance.Tags { // Loop through all tags on the instance
+				if *tag.Key == tagKey { // Check if the tag key matches `instance_mode`
+					modeTag = *tag.Value // If it does, store the tag value (e.g., "other_instances")
+					break                // Exit the loop after finding the tag
+				}
+			}
+
+			// Now you can use the `id`, `currentType`, `state`, and `modeTag` variables in your logic
+
+			// If instance is tagged as "other_instances" and running
+			if modeTag == tagValue && state == "running" {
+				fmt.Printf("🛑 Stopping Instance %s to 🔄 Revert Back to Type %s...\n", id, originalType)
+				stopAndModify(ctx, ec2Client, id, originalType, true, false)
+				continue
+			}
+
+			// If instance is t2.micro
+			if currentType == originalType {
+				fmt.Printf("⬆️  Upgrading instance %s to %s and ▶️  starting...\n", id, newInstanceType)
+				stopAndModify(ctx, ec2Client, id, newInstanceType, false, true)
+			}
+		}
+	}
+}
+
+func stopAndModify(ctx context.Context, client *ec2.Client, instanceID string, newType string, removeTag bool, restartAfter bool) {
+	_, _ = client.StopInstances(ctx, &ec2.StopInstancesInput{
+		InstanceIds: []string{instanceID},
+	})
+	waitUntilStopped(ctx, client, instanceID)
+
+	_, _ = client.ModifyInstanceAttribute(ctx, &ec2.ModifyInstanceAttributeInput{
+		InstanceId:   aws.String(instanceID),
+		InstanceType: &ec2types.AttributeValue{Value: aws.String(newType)},
+	})
+
+	if removeTag {
+		_, _ = client.DeleteTags(ctx, &ec2.DeleteTagsInput{
+			Resources: []string{instanceID},
+			Tags:      []ec2types.Tag{{Key: aws.String(tagKey)}},
+		})
+	} else {
+		_, _ = client.CreateTags(ctx, &ec2.CreateTagsInput{
+			Resources: []string{instanceID},
+			Tags:      []ec2types.Tag{{Key: aws.String(tagKey), Value: aws.String(tagValue)}},
+		})
+	}
+
+	if restartAfter {
+		_, _ = client.StartInstances(ctx, &ec2.StartInstancesInput{
+			InstanceIds: []string{instanceID},
+		})
+	}
+}
+
+func waitUntilStopped(ctx context.Context, client *ec2.Client, instanceID string) {
+	fmt.Printf("🕒 Waiting for instance %s to 🛑 stop...\n", instanceID)
+	for {
+		out, err := client.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: []string{instanceID},
+		})
+		if err != nil {
+			log.Printf("Error while waiting: %v", err)
+			break
+		}
+
+		state := out.Reservations[0].Instances[0].State.Name
+		if state == "stopped" {
+			break
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
